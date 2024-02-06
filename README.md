@@ -6,4 +6,4 @@ you can also see how fast and accurate it become.
 
 It shows how much time you can save with deepspeed and how much f1 score you can get too.
 
-Optimize model you want to optimize and see how fast and accurate it becomes!
+Optimize model you want and see how fast and accurate it becomes!
