@@ -14,7 +14,9 @@ import time
 import deepspeed
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from datasets import Dataset, load_metric
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 from transformers import HfArgumentParser, AutoTokenizer, AutoModelForSeq2SeqLM, GenerationConfig, AdamW
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 #from graph import Graph
 from dataclasses import dataclass, field
 #from utils import load_json
@@ -30,6 +32,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from torch.optim.lr_scheduler import LambdaLR
 
 def tokenize_function(examples):
     
@@ -53,7 +56,7 @@ def tokenize_function(examples):
         "labels": tokenized_labels["input_ids"],
     }
 
-# model_name_or_path = "/data/suhyub/summarization/resources/t5_mss_small_torch"
+model_name_or_path = "/data/suhyub/summarization/resources/t5_mss_small_torch"
 
 tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path
@@ -67,6 +70,7 @@ generation_config = GenerationConfig.from_pretrained(
         model_name_or_path
 )
 
+file_path = '/data/suhyub/summarization/checkpoints/pretraining_t5_finetune_data_kbs_dialog_smr_v3_all_all (1).tsv'
 # file_path = '/data/suhyub/small_pretraining_t5_finetune_data_kbs_dialog_smr_v3_all_all (1) - 복사본.tsv'
 learning_rate = 0.001
 epochs = 50
@@ -96,18 +100,49 @@ test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
 rouge = load_metric("rouge")
 
 deepspeed_config = {
-            "fp8": {"enabled": True},
-            "train_batch_size": 128,
-            "train_micro_batch_size_per_gpu": 2,
-            "gradient_accumulation_steps": 64,
-            "zero_optimization": {
+    "fp8": {
+        "enabled": True,
+        "loss_scale": 0,
+        "loss_scale_window": 1000,
+        "initial_scale_power": 16,
+        "hysteresis": 2,
+        "min_loss_scale": 1
+    },
+
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": "0.001",
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+            "weight_decay": 0.001
+        }
+    },
+
+    "scheduler": {
+    "type": "WarmupLR",
+    "params": {
+        "warmup_min_lr": 0,
+        "warmup_max_lr": 0.001,
+        "warmup_num_steps": 100
+        }
+    },
+
+    "zero_optimization": {
                 "stage": 1,
                 "allgather_partitions": True,
                 "allgather_bucket_size": 5e8,
                 "reduce_scatter": True,
                 "reduce_bucket_size": 5e8
-            },
-            "zero_allow_untested_optimizer": True,
+    },
+
+    "gradient_accumulation_steps": 64,
+    "gradient_clipping": 1.0,
+    "steps_per_print": 2000,
+    "train_batch_size": 128,
+    "train_micro_batch_size_per_gpu": 2,
+    "wall_clock_breakdown": False,
+    "zero_allow_untested_optimizer": True
 }
 
 class EarlyStopping:
@@ -146,7 +181,6 @@ class EarlyStopping:
         print('Eearly stopping parameters are reset')
             
     def save_checkpoint(self, F1_score, model):
-        '''Saves model when the F1 score increase.'''
         if self.verbose:
             self.trace_func(f'F1 score increased ({self.F1_score_max:.6f} --> {F1_score:.6f}).  Saving model ...')
         torch.save(model.state_dict(), self.path)
@@ -213,21 +247,22 @@ def calculate_f1_score(predictions, references):
     rouge_l_f1 = results['rougeL'].mid.fmeasure
     return rouge_l_f1
 
-def train_and_evaluate(model, dataloader, is_deepspeed=False):
+def train_and_evaluate(model, dataloader, is_deepspeed):
     if is_deepspeed:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         deepspeed.init_distributed(dist_backend="nccl", rank=local_rank, distributed_port=29502)
         d_model, _, _, _ = deepspeed.initialize(
             model=model, 
-            optimizer=AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2), 
+            optimizer=AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2),
             config=deepspeed_config
         )
         d_optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
-        scheduler = ReduceLROnPlateau(d_optimizer, mode='max', factor=0.1, patience=5, verbose=True)
+        scheduler = ReduceLROnPlateau(d_optimizer, mode='max', factor=0.1, patience=5, verbose=False)
     else:
         optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=False)
     max_f1 = 0
+            
     for epoch in range(epochs):
         model.train()
         start_time = time.time()
@@ -240,7 +275,11 @@ def train_and_evaluate(model, dataloader, is_deepspeed=False):
                 outputs = d_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             else:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
+            
+            for _, param in model.named_parameters():
+                if param.requires_grad == False:
+                    param.requires_grad = True
+                    
             loss = outputs.loss
             loss.backward()
 
@@ -298,7 +337,7 @@ def train_and_evaluate(model, dataloader, is_deepspeed=False):
 def main():
     print("Training standard T5 \n")
     start_time = time.time()
-    max_f1_score_of_standard_t5 = train_and_evaluate(model.to(device), train_dataloader)
+    max_f1_score_of_standard_t5 = train_and_evaluate(model.to(device), train_dataloader, is_deepspeed=False)
     end_time = time.time()
     standard_t5_time = end_time - start_time
     early_stopping.reset()
